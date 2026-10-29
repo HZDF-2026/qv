@@ -286,6 +286,62 @@ t('B3 无改动快照允许', () => {
   assert(qv(D, 'log').includes('noop'), '空快照应入 log');
 });
 
+// ===== 4.5 v1.4：大文件分块 + push/pull =====
+t('F1 大文件分块存储与块级去重（10GB 级场景缩小版）', () => {
+  const D = tmp();
+  const big = Buffer.alloc(70 * 1024 * 1024);            // 70MB，9 块
+  for (let i = 0; i < big.length; i += 8192) big[i] = i % 251;
+  fs.writeFileSync(path.join(D, 'model.ckpt'), big);
+  const t0 = Date.now(); qv(D, 'init'); const tInit = Date.now() - t0;
+  const snaps = fs.readFileSync(path.join(D, '.qv', 'snapshots.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l));
+  const tree = JSON.parse(fs.readFileSync(path.join(D, '.qv', 'objects', snaps[0].tree.slice(0, 2), snaps[0].tree.slice(2)), 'utf8'));
+  assert(tree['model.ckpt'].chunks && tree['model.ckpt'].chunks.length === 9, '应分 9 块: ' + (tree['model.ckpt'].chunks || []).length);
+  const before = (fs.readdirSync(path.join(D, '.qv', 'objects'))).reduce((n, d) => n + fs.readdirSync(path.join(D, '.qv', 'objects', d)).length, 0);
+  // 尾部改 1 字节 → 只新增 1 块
+  const fh = fs.openSync(path.join(D, 'model.ckpt'), 'r+');
+  fs.writeSync(fh, Buffer.from([255]), 0, 1, 69 * 1024 * 1024); fs.closeSync(fh);
+  qv(D, 'snap', '-m', 'tail edit');
+  const after = (fs.readdirSync(path.join(D, '.qv', 'objects'))).reduce((n, d) => n + fs.readdirSync(path.join(D, '.qv', 'objects', d)).length, 0);
+  const grew = after - before;
+  assert(grew <= 3, `尾部 1 字节改动应只增 ~2 个对象（新块+manifest），实际 ${grew}`);
+  // switch 回基线 → 逐位恢复
+  const baseId = snaps[0].id.slice(0, 12);
+  qv(D, 'switch', baseId);
+  const buf = fs.readFileSync(path.join(D, 'model.ckpt'));
+  assert(Buffer.compare(buf, big) === 0, '大文件恢复不逐位');
+  qv(D, 'verify', '--deep');
+  console.log(`  大文件: init(70MB)=${tInit}ms 增量对象=${grew}`);
+});
+t('F2 push/pull 本地路径模式（跨机同步的回环路径）', () => {
+  const A = tmp(), B = tmp();
+  fs.writeFileSync(path.join(A, 'train.py'), 'v1\n'); qv(A, 'init');
+  qv(A, 'branch', 'exp1'); fs.writeFileSync(path.join(A, 'train.py'), 'v2\n'); qv(A, 'snap', '-m', 'e1'); qv(A, 'switch', 'main');
+  fs.writeFileSync(path.join(B, 'b.txt'), 'b\n'); qv(B, 'init');
+  qv(A, 'push', B);
+  assert(!fs.existsSync(path.join(B, 'train.py')), 'push 只同步对象/分支，不应落盘工作区');
+  const o = qv(B, 'merge', 'exp1');
+  assert(o.includes('干净'), o);
+  assert(R(B, 'train.py') === 'v2\n', 'push 后 merge 应取到 A 侧内容: ' + R(B, 'train.py'));
+  qv(B, 'pull', A);
+  qv(A, 'verify', '--deep'); qv(B, 'verify', '--deep');
+});
+t('F3 大文件冲突语义（分块对象不做行级合并）', () => {
+  const D = tmp();
+  const buf = Buffer.alloc(65 * 1024 * 1024, 7);
+  fs.writeFileSync(path.join(D, 'weights.bin'), buf);
+  qv(D, 'init');
+  qv(D, 'branch', 'dev');
+  const fh = fs.openSync(path.join(D, 'weights.bin'), 'r+'); fs.writeSync(fh, Buffer.from([9]), 0, 1, 0); fs.closeSync(fh);
+  qv(D, 'snap', '-m', 'dev edit'); qv(D, 'switch', 'main');
+  const fh2 = fs.openSync(path.join(D, 'weights.bin'), 'r+'); fs.writeSync(fh2, Buffer.from([8]), 0, 1, 0); fs.closeSync(fh2);
+  qv(D, 'snap', '-m', 'main edit');
+  const o = qv(D, 'merge', 'dev');
+  assert(o.includes('冲突'), '大文件双侧改应标冲突: ' + o);
+  const out = fs.readFileSync(path.join(D, 'weights.bin'));
+  assert(out[0] === 8, '冲突时保留 ours 侧: ' + out[0]);
+  qv(D, 'verify', '--deep');
+});
+
 // ===== 5. 压力 =====
 t('P1 万文件仓库 init+增量+verify', () => {
   const D = tmp(); const t0 = Date.now();

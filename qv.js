@@ -6,10 +6,13 @@ const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
 const crypto = require('crypto');
+const { execFileSync } = require('child_process');
 
 const QV = '.qv';
 const CONC = 32;
-const VERSION = '1.3.0';
+const VERSION = '1.4.0';
+const BIG_FILE = 64 * 1024 * 1024;   // 超过此尺寸走分块存储（AI checkpoint/模型权重场景）
+const CHUNK = 8 * 1024 * 1024;       // 分块大小
 
 const die = (m) => { console.error('qv: ' + m); process.exit(1); };
 const ok = (m) => { console.log(m); };
@@ -28,11 +31,32 @@ async function put(root, buf) {
   return h;
 }
 async function get(root, h) { return fsp.readFile(path.join(objDir(root, h), h.slice(2))); }
+// 大文件分块存储：块本身是小 blob（内容寻址自动去重），块哈希列表内联进 manifest entry
+async function hashBigFile(root, absPath, size) {
+  const fh = await fsp.open(absPath, 'r');
+  try {
+    const buf = Buffer.alloc(CHUNK); const chunks = []; const hashs = [];
+    for (let off = 0; off < size; off += CHUNK) {
+      const { bytesRead } = await fh.read(buf, 0, CHUNK, off);
+      const h = await put(root, buf.subarray(0, bytesRead));
+      chunks.push(h); hashs.push(h);
+    }
+    const top = crypto.createHash('sha256').update(hashs.join('\n')).digest('hex');
+    return { h: top, s: size, chunks };
+  } finally { await fh.close(); }
+}
+// 把对象（普通或分块）流式写到目标路径（大文件不进内存）
+async function materialize(root, entry, dest) {
+  if (!entry.chunks) { await fsp.writeFile(dest, await get(root, entry.h)); return; }
+  const fh = await fsp.open(dest, 'w');
+  try { for (const c of entry.chunks) { await fh.writeFile(await get(root, c)); } } finally { await fh.close(); }
+}
 async function has(root, h) { try { await fsp.access(path.join(objDir(root, h), h.slice(2))); return true; } catch { return false; } }
 
 // ---------- manifest：路径 → {h,size,mtime}，稳定序列化保证内容寻址 ----------
 function manifestBuf(m) {
-  const o = {}; for (const p of Object.keys(m).sort()) o[p] = { h: m[p].h, s: m[p].s };
+  const o = {};
+  for (const p of Object.keys(m).sort()) o[p] = m[p].chunks ? { h: m[p].h, s: m[p].s, chunks: m[p].chunks } : { h: m[p].h, s: m[p].s };
   return Buffer.from(JSON.stringify(o));
 }
 function manifestHash(m) { return crypto.createHash('sha256').update(manifestBuf(m)).digest('hex'); }
@@ -77,6 +101,7 @@ async function scanWorkdir(root, last) {
       const st = await fsp.stat(path.join(root, p));
       const c = last && last[p];
       if (c && c.s === st.size && c.m === Math.floor(st.mtimeMs) && await has(root, c.h)) { m[p] = c; return; }
+      if (st.size > BIG_FILE) { const e = await hashBigFile(root, path.join(root, p), st.size); e.m = Math.floor(st.mtimeMs); m[p] = e; return; }
       const buf = await fsp.readFile(path.join(root, p));
       m[p] = { h: await put(root, buf), s: st.size, m: Math.floor(st.mtimeMs) };
     }));
@@ -133,11 +158,11 @@ async function restore(root, target) {
     await Promise.all(batch.map(async p => {
       const f = path.join(root, p);
       await fsp.mkdir(path.dirname(f), { recursive: true });
-      await fsp.writeFile(f, await get(root, target[p].h));
+      await materialize(root, target[p], f);
     }));
   }
   const now = {};
-  for (const p of Object.keys(target)) { const st = await fsp.stat(path.join(root, p)); now[p] = { h: target[p].h, s: st.size, m: Math.floor(st.mtimeMs) }; }
+  for (const p of Object.keys(target)) { const st = await fsp.stat(path.join(root, p)); now[p] = { ...target[p], s: st.size, m: Math.floor(st.mtimeMs) }; }
   await saveCache(root, now);
 }
 
@@ -252,7 +277,15 @@ async function doMerge(root, srcBr, dstBr, opts) {
     if (hO === hT) { if (hO) result[p] = inO; continue; }
     if (hB === hO) { if (hT) result[p] = inT; continue; } // 只 theirs 改 → 取 theirs
     if (hB === hT) { if (hO) result[p] = inO; continue; } // 只 ours 改 → 取 ours
-    // 双侧同文件不同改动 → 行级三方
+    // 双侧同文件不同改动 → 大文件（分块）不做行级合并：标记冲突保留 ours；普通文件走行级三方
+    const big = (inB && inB.chunks) || (inO && inO.chunks) || (inT && inT.chunks);
+    if (big) {
+      conflicts++;
+      report.push(p);
+      console.error(`  CONFLICT(大文件): ${p}（分块对象不做行级合并，保留 ${hO ? 'ours' : 'theirs'} 侧）`);
+      if (opts.conflict !== 'skip') result[p] = hO ? inO : inT;
+      continue;
+    }
     const txtB = hB ? (await get(root, hB)).toString() : '';
     const txtO = hO ? (await get(root, hO)).toString() : '';
     const txtT = hT ? (await get(root, hT)).toString() : '';
@@ -286,7 +319,10 @@ async function collectReachable(root) {
   for (const s of snaps.values()) {
     hashes.add(s.id); hashes.add(s.tree);
     const m = JSON.parse((await get(root, s.tree)).toString());
-    for (const p of Object.keys(m)) hashes.add(m[p].h);
+    for (const p of Object.keys(m)) {
+      hashes.add(m[p].h);
+      if (m[p].chunks) for (const c of m[p].chunks) hashes.add(c);
+    }
   }
   return { snaps, hashes };
 }
@@ -366,6 +402,63 @@ async function cmdImport(root, file) {
       ok(`已检出 ${inHeads['main'] ? 'main' : Object.keys(inHeads)[0]} 分支工作区（${Object.keys(JSON.parse((await get(root, snaps2.get(mainId).tree)).toString())).length} 文件）`);
     }
   }
+}
+
+// ---------- 跨机同步：push / pull（SSH 主通道 + 本地路径模式，bundle 协议复用） ----------
+function run(argv, opts) { return execFileSync(argv[0], argv.slice(1), { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'], ...opts }); }
+function isRemote(target) { return /^[A-Za-z0-9_.-]+@/.test(target) || /:/.test(target) && !/^[A-Za-z]:[\\/]/.test(target); }
+function parseRemote(target) {
+  // user@host[:dir] 或 user@host:dir
+  const at = target.indexOf('@');
+  const hostAndDir = at >= 0 ? target.slice(at + 1) : target;
+  const ci = hostAndDir.indexOf(':');
+  const host = ci >= 0 ? hostAndDir.slice(0, ci) : hostAndDir;
+  const dir = ci >= 0 ? hostAndDir.slice(ci + 1) : 'qv-repo';
+  const user = at >= 0 ? target.slice(0, at) : null;
+  return { sshTarget: user ? `${user}@${host}` : host, dir: dir.replace(/\\/g, '/') };
+}
+async function ensureRemoteTool(rt, localTool) {
+  // 远程没有 qv.js 则自引导传一份（单文件自足性）
+  try { run(['ssh', rt.sshTarget, `test -f ${rt.dir}/qv.js`]); return `${rt.dir}/qv.js`; }
+  catch {
+    run(['ssh', rt.sshTarget, `mkdir -p ${rt.dir}`]);
+    run(['scp', localTool, `${rt.sshTarget}:${rt.dir}/qv.js`]);
+    return `${rt.dir}/qv.js`;
+  }
+}
+async function cmdPush(root, target, toolPath) {
+  const tmpBundle = path.join(process.env.TEMP || '/tmp', `qv-push-${Date.now()}.qvb`);
+  await cmdExport(root, tmpBundle);
+  if (isRemote(target)) {
+    const rt = parseRemote(target);
+    const remoteTool = await ensureRemoteTool(rt, toolPath || __filename);
+    run(['scp', tmpBundle, `${rt.sshTarget}:${rt.dir}/.qv-incoming.qvb`]);
+    const out = run(['ssh', rt.sshTarget, `node ${remoteTool} import ${rt.dir}/.qv-incoming.qvb && rm -f ${rt.dir}/.qv-incoming.qvb`]);
+    process.stdout.write(out);
+  } else {
+    // 本地路径模式（同机仓库目录直推，也用于 CI/回环测试）
+    const destRoot = path.resolve(target);
+    if (!fs.existsSync(path.join(destRoot, QV))) die(`目标不是 qv 仓库: ${destRoot}（先在其 init 或 import clone）`);
+    await cmdImport(destRoot, tmpBundle);
+  }
+  fs.unlinkSync(tmpBundle);
+  ok(`push -> ${target} 完成`);
+}
+async function cmdPull(root, target, toolPath) {
+  const tmpBundle = path.join(process.env.TEMP || '/tmp', `qv-pull-${Date.now()}.qvb`);
+  if (isRemote(target)) {
+    const rt = parseRemote(target);
+    const remoteTool = await ensureRemoteTool(rt, toolPath || __filename);
+    run(['ssh', rt.sshTarget, `node ${remoteTool} export ${rt.dir}/.qv-outgoing.qvb`]);
+    run(['scp', `${rt.sshTarget}:${rt.dir}/.qv-outgoing.qvb`, tmpBundle]);
+    run(['ssh', rt.sshTarget, `rm -f ${rt.dir}/.qv-outgoing.qvb`]);
+  } else {
+    const srcRoot = path.resolve(target);
+    await cmdExport(srcRoot, tmpBundle);
+  }
+  await cmdImport(root, tmpBundle);
+  fs.unlinkSync(tmpBundle);
+  ok(`pull <- ${target} 完成；可 merge 同步过来的分支`);
 }
 
 async function cmdInit(root) {
@@ -486,7 +579,15 @@ async function cmdVerify(root, deep) {
     if (deep) {
       const m = JSON.parse(treeBuf.toString());
       for (const p of Object.keys(m)) {
-        try { const buf2 = await get(root, m[p].h); if (crypto.createHash('sha256').update(buf2).digest('hex') !== m[p].h) { bad++; console.error(`blob 损坏: ${p}`); } checked++; }
+        const e = m[p];
+        if (e.chunks) {
+          for (const c of e.chunks) {
+            try { const b = await get(root, c); if (crypto.createHash('sha256').update(b).digest('hex') !== c) { bad++; console.error(`块损坏: ${p}[${c.slice(0, 8)}]`); } checked++; }
+            catch { bad++; console.error(`块缺失: ${p}[${c.slice(0, 8)}]`); }
+          }
+          continue;
+        }
+        try { const buf2 = await get(root, e.h); if (crypto.createHash('sha256').update(buf2).digest('hex') !== e.h) { bad++; console.error(`blob 损坏: ${p}`); } checked++; }
         catch { bad++; console.error(`blob 缺失: ${p}`); }
       }
     }
@@ -501,7 +602,10 @@ async function cmdGc(root) {
   for (const s of snaps.values()) {
     live.add(s.id); live.add(s.tree);
     const m = JSON.parse((await get(root, s.tree)).toString());
-    for (const p of Object.keys(m)) live.add(m[p].h);
+    for (const p of Object.keys(m)) {
+      live.add(m[p].h);
+      if (m[p].chunks) for (const c of m[p].chunks) live.add(c);
+    }
   }
   const base = path.join(root, QV, 'objects');
   let removed = 0;
@@ -574,11 +678,13 @@ async function main() {
     case 'verify': return cmdVerify(root, rest.includes('--deep'));
     case 'export': return cmdExport(root, rest[0]);
     case 'import': return cmdImport(root, rest[0]);
+    case 'push': return cmdPush(root, rest[0], rest[1] && rest[1].startsWith('--tool=') ? rest[1].slice(7) : undefined);
+    case 'pull': return cmdPull(root, rest[0], rest[1] && rest[1].startsWith('--tool=') ? rest[1].slice(7) : undefined);
     case 'gc': return cmdGc(root);
     case 'diff': return cmdDiff(root, rest[0], rest[1]);
     case 'status': return cmdStatus(root);
     default:
-      ok('qv — 快照模型 VCS（实验 O(1) / sha256 内容寻址 / 批量合并）\n用法: init | snap [-m msg] | branch [name] | switch <br|snap> | log | merge <src> [--into=dst] | batch-merge [pattern...] | verify [--deep] | export <file.qvb> | import <file.qvb> | diff [<a> <b>] | status | drop <br> | --version');
+      ok('qv — 快照模型 VCS（实验 O(1) / sha256 内容寻址 / 批量合并）\n用法: init | snap [-m msg] | branch [name] | switch <br|snap> | log | merge <src> [--into=dst] | batch-merge [pattern...] | verify [--deep] | export <file.qvb> | import <file.qvb> | push <user@host:dir|本地路径> | pull <...> | diff [<a> <b>] | status | drop <br> | --version\n大文件(>64MB)自动分块存储；push/pull 走系统 ssh/scp（零依赖），远程无 qv 会自动传一份过去');
       if (cmd) die('未知命令: ' + cmd);
   }
 }

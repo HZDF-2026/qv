@@ -88,6 +88,18 @@ Patch releases (same field-trial loop):
 
 `qv diff <a> <b>` now diffs any two branches/snapshots (`+`/`-`/`~`), filling qv's biggest query gap. Born from an honest comparison against Anthropic's internal VCS — the full analysis, including the unmet points we deliberately record instead of build (delta manifests, sparse checkouts, daemon mode), is in [docs/SCION_NOTES.md](docs/SCION_NOTES.md).
 
+## v1.4 — big files & cross-machine sync
+
+**Chunked storage for big files (>64MB auto-chunked at 8MB, for AI checkpoints / model weights up to ~100GB):**
+- Byte-level dedup across snapshots — editing one byte of a 70MB file adds ~1 chunk instead of a whole new blob (measured: 3 objects).
+- `verify --deep` audits every chunk; restores are streamed (big files never fully load into memory).
+- Big-file merges are deliberately whole-file: both-sides edits conflict, ours kept (no in-memory line merge of a 10GB file).
+
+**Cross-machine sync — `qv push / qv pull <user@host:dir>`:**
+- Runs over the system `ssh`/`scp` (zero npm dependencies); if the remote has no qv, the tool pushes itself over first.
+- Same-path local mode (`qv push ../other-repo`) covers same-machine repos and CI loops.
+- Other transports stay available because the `.qvb` bundle is one portable file (rsync, HTTP, sneakernet all work).
+
 ## Honest limitations
 
 - LAN bundle sync is **explicit** (no server, no auto-push) — a feature in hostile networks.
