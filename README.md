@@ -1,92 +1,146 @@
 # qv — quick-experiment VCS
 
-**Snapshot-model version control for AI-scale experimentation.** 面向代码快速实验与大批量合并的快照模型版本控制——单文件、零依赖、SHA-256 内容寻址、可验证安全。
+**Snapshot-model version control for fast, safe experimentation.** Single file, zero dependencies, SHA-256 content-addressed, tamper-detecting. Built for the workflow "snap before you edit, roll back in one second, hand off as one file."
 
 ```
-$ qv branch exp42          # 零拷贝开实验线
-$ qv switch exp42          # 只写差异，秒切
-$ ... 改代码 ...
-$ qv snap -m "尝试A"        # 增量快照（只哈希改动过的文件）
-$ qv switch main
-$ qv batch-merge           # 一条命令级联合并所有实验分支，冲突自动跳过留报告
-批量合并 30 个分支: ...  耗时 933ms
+$ qv snap -m "before refactor"      # incremental snapshot (hash only what changed)
+$ ...edit...                         # break something?
+$ qv switch <snapshot>               # back in one second, only touched files rewritten
+$ qv export handoff.qvb              # whole project state as ONE file for a colleague
 ```
 
-## 为什么不是 git
+## Where qv shines — and where it doesn't (field-tested)
 
-git 为人类协作设计；qv 为 **AI agent 级别的实验吞吐**设计：
+| Scenario | Use qv? |
+|---|---|
+| Put version control on an unversioned codebase (no git yet) | ✅ **Strongly recommended** — zero-config safety net |
+| Snap before editing, one-second rollback when you break it | ✅ **Its strongest suit** |
+| Hand current state to a colleague/customer as one file | ✅ `export` makes a single self-contained `.qvb` |
+| Many parallel experiment lines touching the **same files**, batch-merged | ⚠️ You will hit frequent **whole-file conflicts**; prefer mostly-disjoint experiments, or just copy folders |
+| Public release history / internet collaboration | ❌ Use git — qv deliberately doesn't do this |
 
-| 痛点 | git | qv |
-|---|---|---|
-| 开 30 条实验线 | worktree 重量级/分支切换全树 IO | `branch` 零拷贝（分支=指针） |
-| 切换实验 | 重写整个工作区 | 只写差异文件 |
-| 大批量合并 | 逐个 rebase/merge 手工操作 | `batch-merge` 级联+冲突跳过+报告 |
-| 存储完整性 | zlib 对象流，尾部垃圾可被静默忽略 | **明文内容寻址：sha256(文件字节)==键，`verify` 检出任何字节篡改** |
-| 哈希 | SHA-1（迁移中） | SHA-256，全套（快照/树/blob） |
-| 丢弃实验 | ref+reflog 结构纠缠 | `drop` 一条引用，reflog 可追溯，`gc` 收孤儿 |
-| 上手 | 概念多 | 单文件 ~400 行核心，读得完 |
+## Why not just git
 
-## 设计
+git is designed for human collaboration and public history; qv is designed for **throughput of local experiments**:
 
-- **快照模型**：每次 `snap` 把工作区 manifest（路径→内容哈希）存为不可变对象；分支只是指向快照的指针——实验成本 O(1)。
-- **增量哈希**：mtime+size 未变的文件沿用缓存哈希，快照开销正比于改动量而非仓库规模。
-- **三方合并**：LCA → 文件级（单侧改动自动采纳）→ 行级（双侧改动 LCS 三方，冲突写 `<<<<<<<` 标记不阻塞）。
-- **安全**：对象库明文存储，`verify [--deep]` 对快照/树/blob 全量重哈希——任何存储层篡改（哪怕 zlib 时代的"尾部追加"技巧）直接 FAIL。追加式 snapshots.jsonl + reflog，drop 可追溯。
-- **低开销**：对象去重（相同内容全局只存一份）、并发哈希（32 路）、restore 只写差异。
+- Branches are pointers — creating/switching experiment lines is zero-copy and diffs-only.
+- `snap` hashes only changed files (mtime+size cached), so snapshot cost tracks your edit size, not repo size.
+- `batch-merge` cascades N experiment branches in one command; conflicting branches are skipped and reported.
+- The object store is **plaintext, SHA-256 content-addressed**: `qv verify --deep` re-hashes snapshots/trees/blobs and catches **any byte-level tampering** (zlib-style stream-append tricks don't work here — that's why we don't compress objects).
+- Appended-only `snapshots.jsonl` + reflog: `drop` is traceable, `gc` collects orphans.
 
-## 快速开始（Node >= 20，无依赖）
+## Quick start (Node >= 20, zero deps)
 
 ```bash
-node qv.js init                       # 初始化并打基线快照
-node qv.js snap -m "msg"              # 增量快照
-node qv.js branch exp1                # 开实验线（零拷贝）
-node qv.js switch exp1                # 切换（分支名或快照短哈希均可）
-node qv.js merge exp1 [--into=main]   # 三方合并（冲突标记制）
-node qv.js batch-merge [pattern...]   # 批量级联合并（冲突分支跳过并列出）
-node qv.js verify --deep              # 全库 Merkle 校验
+node qv.js init                       # initialize + baseline snapshot
+node qv.js snap -m "msg"              # incremental snapshot
+node qv.js branch exp1                # open an experiment line (zero-copy)
+node qv.js switch exp1                # switch (branch name or snapshot short-hash)
+node qv.js merge exp1 [--into=main]   # 3-way merge (LCA → file → line level)
+node qv.js batch-merge [pattern...]   # cascade-merge all experiment branches
+node qv.js verify --deep              # full Merkle audit
+node qv.js export f.qvb / import f.qvb  # LAN handoff; import into empty dir = clone
 node qv.js gc / drop <br> / log / diff / status
 ```
 
-## 局域网协作（v1.1）
-
-无服务器设计——bundle 文件即传输协议，SMB/scp/U 盘都行：
+## LAN collaboration (v1.1) — bundle files as the protocol
 
 ```
-机器 A:  qv export a.qvb              # 打包全部可达对象+快照+分支
-机器 B:  qv import a.qvb              # 空目录导入 = clone（自动检出工作区）
-机器 B:  ...改代码...  qv snap
-机器 B:  qv merge feature-a            # 共同历史 → 正常三方合并
+Machine A:  qv export a.qvb
+Machine B:  qv import a.qvb        # empty dir → clone (workdir auto-checked-out)
+Machine B:  ...edit... qv snap; qv merge feature-a
 ```
 
-- **防投毒**：import 对每个对象全量重哈希，声称哈希≠实际内容直接拒绝整个 bundle。
-- **无关历史**：两个独立 `init` 的仓库合并（无共同祖先）按整文件冲突处理（同 git unrelated histories 语义），有测试钉死该行为。
-- **幂等**：重复 import 相同对象自动跳过；分支名冲突自动改名 `<branch>-peer`。
+Poison-proof: every object is re-hashed on import — a mismatched hash rejects the whole bundle. Unrelated histories merge as whole-file conflicts (like git). Branch name clashes auto-rename to `<branch>-peer`. Re-imports are idempotent.
 
-## 实测基准（Windows / Node 24 / NVMe，见 test/）
+## Benchmarks (Windows / Node 24 / NVMe, see test/)
 
-| 操作 | 耗时 |
+| Operation | Time |
 |---|---|
-| init 2000 文件（~4MB） | 1.9s |
-| 增量 snap（10 文件改动） | 0.35s |
-| verify --deep（全库重哈希） | 0.72s |
-| batch-merge 30 分支 | 0.93s |
+| init 2,000 files (~4MB) | 1.9s |
+| incremental snap (10 files changed) | 0.35s |
+| verify --deep (full re-hash) | 0.72s |
+| batch-merge 30 branches | 0.93s |
+| stress: init 10,000 files / 200-branch batch-merge | 16s / 3.2s |
 
-## 测试
+## Tests — 32 green
 
 ```bash
-node test/run-tests.js          # 15 项基础 e2e（含冲突/批量合并/篡改检测/基准）
-node test/industrial-suite.js   # 17 项工业套件（单元/跨仓往返/安全/边界/压力/幂等）
+node test/run-tests.js          # 15 e2e (conflicts, batch-merge, tamper detection, benchmarks)
+node test/industrial-suite.js   # 17 industrial (units, cross-repo roundtrip, poison rejection,
+                                #  path traversal, boundaries, 10k-file stress, 300-deep chains)
 ```
 
-工业套件覆盖：diff3 与路径穿越**单元测试**、export/import 往返与 clone、篡改 bundle 拒绝、伪 bundle 拒绝、恶意 manifest 路径穿越防护、空文件/二进制/中文名/5MB 大文件/深层目录边界、**万文件仓库**、**200 分支批量合并**、300 深链、gc 幂等与 drop 可追溯。全部 32 项绿。
+## Honest limitations
 
-## 诚实的局限（v1.1 有意不做）
+- LAN bundle sync is **explicit** (no server, no auto-push) — a feature in hostile networks.
+- Line merges use LCS; very large files (>5k lines both sides) degrade to whole-file conflict markers.
+- No rename tracking, no submodules, no packfile — verifiability beats disk savings.
+- Note: `switch <old-snapshot>` followed by `snap` moves the branch head there (snapshot semantics, like git reset).
 
-- **局域网 bundle 协作**而非常驻服务器：无自动同步/推送钩子——bundle 导出导入是显式动作（这在恶意内网中是特性不是缺陷）。
-- 行级合并用 LCS，超大文件（>5k 行双侧）退化为整文件冲突标记。
-- 无 rename 检测、无子模块、无 packfile——对象库明文优先保证可验证性，牺牲磁盘占用。
-- 适合：AI agent 并行实验区、个人快速原型场、大批量自动化变更线、小团队局域网协作。不适合：公网分布式团队协作（那仍然是 git 的地盘）。
+## Résumé (Français)
+
+**qv** est un système de contrôle de versions à modèle d'instantanés, conçu pour l'expérimentation rapide : branches sans copie, instantanés incrémentaux (seuls les fichiers modifiés sont hachés), retour arrière en une seconde, fusion en cascade de multiples branches, et vérification d'intégrité SHA-256 qui détecte toute falsification au niveau de l'octet. Un seul fichier, zéro dépendance (Node ≥ 20). Pour la publication publique et la collaboration sur Internet, restez sur git — qv est fait pour l'expérimentation locale et la transmission par fichier unique sur le réseau local.
 
 ## License
 
 MIT
+
+---
+
+<details>
+<summary><b>中文说明（Chinese）</b></summary>
+
+# qv — 快照模型 VCS
+
+面向代码快速实验与安全回滚的快照模型版本控制——单文件、零依赖、SHA-256 内容寻址、可验证防篡改。
+
+## 实测定位（来自外部 Agent 试驾反馈）
+
+| 场景 | 用不用 qv |
+|---|---|
+| 给没有版本管理的仓库上保险（连 git 都没有的裸奔项目） | ✅ 强烈建议——零成本安全网 |
+| 改前 snap、改坏 switch 秒回滚 | ✅ **最强场景** |
+| 把当前状态 export 一个 .qvb 给客户/同事 | ✅ 单文件最方便 |
+| 同一文件并行开多条实验线再批量合并 | ⚠️ 会频繁撞**整文件冲突**——适合互不重叠的实验线，或干脆复制副本 |
+| 对外发布历史 / 公网协作 | ❌ 仍用 git（qv 有意不做） |
+
+## 快速开始（Node >= 20，零依赖）
+
+```bash
+node qv.js init                       # 初始化并打基线快照
+node qv.js snap -m "msg"              # 增量快照（只哈希改动文件）
+node qv.js branch exp1                # 零拷贝开实验线
+node qv.js switch exp1                # 切换（分支名或快照短哈希均可）
+node qv.js merge exp1 [--into=main]   # 三方合并（冲突写标记不阻塞）
+node qv.js batch-merge [pattern...]   # 批量级联合并（冲突分支跳过并报告）
+node qv.js verify --deep              # 全库 Merkle 校验（防篡改）
+node qv.js export f.qvb / import f.qvb  # 局域网交付；空目录 import = clone
+node qv.js gc / drop <br> / log / diff / status
+```
+
+## 安全设计
+
+- 对象库**明文存储、SHA-256 内容寻址**：`verify --deep` 对快照/树/blob 全量重哈希，任何字节级篡改直接 FAIL（zlib 流尾部追加那类技巧在本库无效——这正是我们不压缩对象的原因）。
+- bundle 导入对每个对象全量重哈希防投毒；路径穿越（`../`、盘符、空字节）全部拒绝。
+- 追加式 `snapshots.jsonl` + reflog：drop 可追溯，gc 收孤儿。
+
+## 实测基准（Windows / Node 24 / NVMe）
+
+init 2000 文件 1.9s / 增量 snap 0.35s / verify --deep 0.72s / batch-merge 30 分支 0.93s；压力：万文件 init 16s、200 分支批量合并 3.2s。
+
+## 测试：32 项全绿
+
+`node test/run-tests.js`（15 项基础 e2e）+ `node test/industrial-suite.js`（17 项工业套件：单元、跨仓往返、防投毒、路径穿越、边界、压力、幂等）。
+
+## 局限（诚实声明）
+
+- 局域网 bundle 协作是显式动作（无服务器无自动推送——恶意内网中这是特性）。
+- 行级合并用 LCS，超大文件退化为整文件冲突标记。
+- 无 rename 检测/子模块/packfile——可验证性优先于磁盘占用。
+- `switch 旧快照` 后 `snap` 会移动分支头（快照语义，类似 git reset）。
+
+## License
+
+MIT
+</details>
