@@ -74,6 +74,8 @@ node test/industrial-suite.js   # 21 industrial (units, cross-repo roundtrip, po
 
 ## v1.2 — merge & hygiene upgrades (from field feedback)
 
+> The full sanitized field-trial record — an external AI agent's review, its reported defects, and the fixes — is in [docs/FIELD_TRIAL.md](docs/FIELD_TRIAL.md).
+
 - **Chunk-level 3-way merge**: real conflicts require genuinely overlapping edits at the same region — same-file experiments touching different parts now merge cleanly (deletions no longer misalign into phantom conflicts).
 - **Rename detection**: one side renames a file, the other edits it → the edit migrates to the new path instead of being lost.
 - **`.qvignore`** (gitignore-style subset): keeps 46MB sqlite files, `dist/`, caches out of the object store. Built-in minimum defaults: `node_modules/`, `__pycache__/`. Ignored-but-previously-tracked files are never deleted from your workdir by `switch`.
