@@ -16,7 +16,7 @@ $ qv export handoff.qvb              # whole project state as ONE file for a col
 | Put version control on an unversioned codebase (no git yet) | ✅ **Strongly recommended** — zero-config safety net |
 | Snap before editing, one-second rollback when you break it | ✅ **Its strongest suit** |
 | Hand current state to a colleague/customer as one file | ✅ `export` makes a single self-contained `.qvb` |
-| Many parallel experiment lines touching the **same files**, batch-merged | ⚠️ You will hit frequent **whole-file conflicts**; prefer mostly-disjoint experiments, or just copy folders |
+| Many parallel experiment lines touching the **same files**, batch-merged | ⚠️ v1.2 merges **different regions of the same file cleanly** (chunk-level 3-way); only genuinely overlapping edits (same region, both sides) conflict |
 | Public release history / internet collaboration | ❌ Use git — qv deliberately doesn't do this |
 
 ## Why not just git
@@ -67,15 +67,22 @@ Poison-proof: every object is re-hashed on import — a mismatched hash rejects 
 
 ```bash
 node test/run-tests.js          # 15 e2e (conflicts, batch-merge, tamper detection, benchmarks)
-node test/industrial-suite.js   # 17 industrial (units, cross-repo roundtrip, poison rejection,
-                                #  path traversal, boundaries, 10k-file stress, 300-deep chains)
+node test/industrial-suite.js   # 21 industrial (units, cross-repo roundtrip, poison rejection,
+                                #  path traversal, boundaries, 10k-file stress, 300-deep chains,
+                                #  chunk-merge units, rename merge, .qvignore)
 ```
+
+## v1.2 — merge & hygiene upgrades (from field feedback)
+
+- **Chunk-level 3-way merge**: real conflicts require genuinely overlapping edits at the same region — same-file experiments touching different parts now merge cleanly (deletions no longer misalign into phantom conflicts).
+- **Rename detection**: one side renames a file, the other edits it → the edit migrates to the new path instead of being lost.
+- **`.qvignore`** (gitignore-style subset): keeps 46MB sqlite files, `dist/`, caches out of the object store. Built-in minimum defaults: `node_modules/`, `__pycache__/`. Ignored-but-previously-tracked files are never deleted from your workdir by `switch`.
 
 ## Honest limitations
 
 - LAN bundle sync is **explicit** (no server, no auto-push) — a feature in hostile networks.
 - Line merges use LCS; very large files (>5k lines both sides) degrade to whole-file conflict markers.
-- No rename tracking, no submodules, no packfile — verifiability beats disk savings.
+- No submodules, no packfile — the object store is plaintext to keep `verify` byte-exact.
 - Note: `switch <old-snapshot>` followed by `snap` moves the branch head there (snapshot semantics, like git reset).
 
 ## Résumé (Français)
@@ -102,7 +109,7 @@ MIT
 | 给没有版本管理的仓库上保险（连 git 都没有的裸奔项目） | ✅ 强烈建议——零成本安全网 |
 | 改前 snap、改坏 switch 秒回滚 | ✅ **最强场景** |
 | 把当前状态 export 一个 .qvb 给客户/同事 | ✅ 单文件最方便 |
-| 同一文件并行开多条实验线再批量合并 | ⚠️ 会频繁撞**整文件冲突**——适合互不重叠的实验线，或干脆复制副本 |
+| 同一文件并行开多条实验线再批量合并 | ⚠️ v1.2 已支持**同文件不同区域干净合并**（chunk 级三方）；只有真重叠（同区域双侧都改）才冲突 |
 | 对外发布历史 / 公网协作 | ❌ 仍用 git（qv 有意不做） |
 
 ## 快速开始（Node >= 20，零依赖）

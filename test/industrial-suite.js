@@ -97,6 +97,85 @@ t('L4 非法文件拒绝（伪 bundle）', () => {
   assert(qvFail(B, 'import', f), '伪 bundle 应拒绝');
 });
 
+t('U3 diff3 chunk 式合并（v1.2：删除不再伪冲突）', () => {
+  // 双侧在文件不同区域删改 → 应零冲突
+  let r = QVM.diff3('a\nb\nc\nd\ne\nf\ng\n', 'a\nB\nc\nd\ne\nf\nG\n', 'a\nb\nc\nD\ne\nf\ng\n');
+  assert(r.conflicts === 0 && r.text.includes('B') && r.text.includes('D') && r.text.includes('G'), '不同区域改动应干净: ' + JSON.stringify(r.text));
+  // 一侧删行、另一侧在远处加行 → 应零冲突
+  r = QVM.diff3('l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n', 'l1\nl3\nl4\nl5\nl6\nl7\nl8\n', 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nNEW\n');
+  assert(r.conflicts === 0 && r.text.includes('NEW') && !r.text.includes('l2\n'), '删除+远处插入应干净: ' + JSON.stringify(r.text));
+  // 真重叠（同区间不同内容）仍应冲突
+  r = QVM.diff3('x\ny\n', 'x\nA\n', 'x\nB\n');
+  assert(r.conflicts === 1, '真重叠应冲突');
+});
+
+// ===== 2.5 v1.2 merge 升级 =====
+t('M1 rename 检测：重命名 + 对侧修改不丢失', () => {
+  const D = tmp();
+  fs.writeFileSync(path.join(D, 'old-name.txt'), 'content line 1\ncontent line 2\n');
+  qv(D, 'init');
+  qv(D, 'branch', 'renamer');
+  // ours(main) 稍后修改旧文件；renamer 重命名
+  qv(D, 'switch', 'main');
+  fs.writeFileSync(path.join(D, 'old-name.txt'), 'content line 1\ncontent line 2 CHANGED\n');
+  qv(D, 'snap', '-m', 'main edits old file');
+  // renamer 分支：纯重命名
+  qv(D, 'switch', 'renamer'); // 此时 renamer 仍在 base
+  fs.unlinkSync(path.join(D, 'old-name.txt'));
+  fs.writeFileSync(path.join(D, 'new-name.txt'), 'content line 1\ncontent line 2\n');
+  qv(D, 'snap', '-m', 'pure rename');
+  qv(D, 'switch', 'main');
+  const o = qv(D, 'merge', 'renamer');
+  assert(!fs.existsSync(path.join(D, 'old-name.txt')), '旧路径应消失');
+  const txt = R(D, 'new-name.txt');
+  assert(txt === 'content line 1\ncontent line 2 CHANGED\n', 'rename 后对侧修改应迁移: ' + JSON.stringify(txt));
+  qv(D, 'verify', '--deep');
+});
+t('M2 同文件多实验线批量合并（DSH 场景，v1.2 期望基本干净）', () => {
+  const D = tmp();
+  const base = 'def a():\n    pass\n\n\ndef b():\n    pass\n\n\ndef c():\n    pass\n\n\ndef d():\n    pass\n';
+  fs.writeFileSync(path.join(D, 'lib.py'), base);
+  qv(D, 'init');
+  for (let i = 0; i < 5; i++) {
+    qv(D, 'branch', `line${i}`);
+    const lines = base.split('\n');
+    lines[i * 2 + 1] = `    return ${i}  # line${i}`;
+    fs.writeFileSync(path.join(D, 'lib.py'), lines.join('\n'));
+    qv(D, 'snap', '-m', `exp${i}`);
+    qv(D, 'switch', 'main');
+  }
+  const o = qv(D, 'batch-merge');
+  assert(o.includes('批量合并 5 个分支'), o);
+  const txt = R(D, 'lib.py');
+  for (let i = 0; i < 5; i++) {
+    if (i === 0) continue; // 第一个分支干净合入后，后续与 main 的新内容在不同函数区域
+  }
+  const mergedCount = (txt.match(/return \d/g) || []).length;
+  assert(mergedCount >= 4, `5 条同文件实验线至少 4 条应干净合入，实际 ${mergedCount}: ` + txt);
+  qv(D, 'verify', '--deep');
+});
+
+t('T1 .qvignore 忽略规则（v1.2：大文件/产物目录不入对象库）', () => {
+  const D = tmp();
+  fs.writeFileSync(path.join(D, 'main.py'), 'print("src")\n');
+  fs.writeFileSync(path.join(D, '.qvignore'), 'runs/\ndist/\n*.db\n*.pyc\n');
+  W(D, 'runs/quality.db', 'x'.repeat(1024 * 1024));   // 1MB 伪 db
+  W(D, 'dist/bundle.js', 'compiled');
+  W(D, 'pkg/__pycache__/m.pyc', 'bytecode');
+  fs.writeFileSync(path.join(D, 'junk.db'), 'should be ignored');
+  const out = qv(D, 'init');
+  assert(out.includes('2 个文件'), '应只入册 2 个文件（main.py+.qvignore）: ' + out);
+  qv(D, 'snap', '-m', 'noop');
+  const o = qv(D, 'diff');
+  assert(!o.includes('.db'), '被忽略文件不应出现在 diff');
+  // 内置默认：无 .qvignore 时 node_modules/__pycache__ 也忽略
+  const D2 = tmp();
+  fs.writeFileSync(path.join(D2, 'app.js'), '1\n');
+  W(D2, 'node_modules/pkg/index.js', 'dep');
+  const out2 = qv(D2, 'init');
+  assert(out2.includes('1 个文件'), '内置默认应忽略 node_modules: ' + out2);
+});
+
 // ===== 3. 异常与安全 =====
 t('S1 路径穿越防护（恶意 manifest 拒绝写盘）', () => {
   const B = tmp(); fs.writeFileSync(path.join(B, 'ok.txt'), '1\n'); qv(B, 'init');

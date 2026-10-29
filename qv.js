@@ -36,11 +36,28 @@ function manifestBuf(m) {
 }
 function manifestHash(m) { return crypto.createHash('sha256').update(manifestBuf(m)).digest('hex'); }
 
+// ---------- 忽略规则（.qvignore，gitignore 风格子集；内置最低默认集） ----------
+async function loadIgnores(root) {
+  const pats = ['node_modules/', '__pycache__/'];
+  try {
+    const txt = await fsp.readFile(path.join(root, '.qvignore'), 'utf8');
+    for (let ln of txt.split(/\r?\n/)) { ln = ln.trim(); if (ln && !ln.startsWith('#')) pats.push(ln); }
+  } catch {}
+  const rxs = pats.map(p => {
+    const dir = p.endsWith('/');
+    const body = p.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[^/]*');
+    return dir ? new RegExp('^' + body) : new RegExp('(^|/)' + body + '$');
+  });
+  return (p) => rxs.some(rx => rx.test(p));
+}
+
 // ---------- 工作区扫描（增量：mtime+size 未变沿用缓存哈希） ----------
 async function scanWorkdir(root, last) {
+  const ignored = await loadIgnores(root);
   const all = await fsp.readdir(root, { recursive: true, withFileTypes: true });
   const files = all.filter(d => d.isFile()).map(d => path.relative(root, path.join(d.parentPath || d.path, d.name)).replace(/\\/g, '/'))
-    .filter(p => p !== QV && !p.startsWith(QV + '/'));
+    .filter(p => p !== QV && !p.startsWith(QV + '/'))
+    .filter(p => !ignored(p));
   const m = {};
   const queue = [...files];
   while (queue.length) {
@@ -84,9 +101,10 @@ async function loadCache(root) { try { return (JSON.parse(await fsp.readFile(pat
 // ---------- 工作区恢复（只写差异：目标 vs 缓存盘面） ----------
 async function restore(root, target) {
   const cur = (await loadCache(root)) || {};
+  const ignored = await loadIgnores(root);
   const paths = Object.keys(target);
   for (const p of paths) if (!safePath(p)) die(`非法路径（拒绝写入）: ${JSON.stringify(p)}`);
-  const toDel = Object.keys(cur).filter(p => !(p in target));
+  const toDel = Object.keys(cur).filter(p => !(p in target)).filter(p => !ignored(p));
   await Promise.all(toDel.map(p => fsp.rm(path.join(root, p), { force: true })));
   const toWrite = Object.keys(target).filter(p => !(p in cur) || cur[p].h !== target[p].h);
   const q = [...toWrite];
@@ -120,37 +138,61 @@ function lca(snaps, a, b) {
   }
   return null;
 }
-function diff3(base, ours, theirs) { // 行级三方，返回合并文本与冲突数
+// LCS 匹配对（base 行号, side 行号）——chunk 式 diff 的基础
+function matchPairs(x, y) {
+  const n = x.length, m = y.length;
+  if (n * m > 25e6) return null;
+  const dp = new Int32Array((n + 1) * (m + 1));
+  for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--)
+    dp[i * (m + 1) + j] = x[i] === y[j] ? dp[(i + 1) * (m + 1) + j + 1] + 1 : Math.max(dp[(i + 1) * (m + 1) + j], dp[i * (m + 1) + j + 1]);
+  const pairs = []; let i = 0, j = 0;
+  while (i < n && j < m) {
+    if (x[i] === y[j]) { pairs.push([i, j]); i++; j++; }
+    else if (dp[(i + 1) * (m + 1) + j] >= dp[i * (m + 1) + j + 1]) i++; else j++;
+  }
+  return pairs;
+}
+// 匹配对之间的差异段（chunk）——天然覆盖插入/删除/修改三种形态
+function chunksFromPairs(pairs, baseLen, S) {
+  const chunks = []; let pb = -1, ps = -1;
+  for (const [bi, si] of [...pairs, [baseLen, S.length]]) {
+    if (bi > pb + 1 || si > ps + 1) chunks.push({ b0: pb + 1, b1: bi, s: S.slice(ps + 1, si) });
+    pb = bi; ps = si;
+  }
+  return chunks;
+}
+// chunk 式三方合并：区间不重叠双侧各取，真重叠才冲突（删除不再错位成伪冲突）
+function diff3(base, ours, theirs) {
   if (ours === theirs) return { text: ours, conflicts: 0 };
   if (base === ours) return { text: theirs, conflicts: 0 };
   if (base === theirs) return { text: ours, conflicts: 0 };
   const B = base.split('\n'), O = ours.split('\n'), T = theirs.split('\n');
-  if (B.length * O.length > 25e6 || B.length * T.length > 25e6) // 超大文件退化：整文件冲突
+  const pO = matchPairs(B, O), pT = matchPairs(B, T);
+  if (!pO || !pT) // 超大文件退化：整文件冲突
     return { text: '<<<<<<< OURS\n' + ours + '\n=======\n' + theirs + '\n>>>>>>> THEIRS\n', conflicts: 1 };
-  const lcs = (x, y) => { // 返回 x 的稳定行集（简化：以出现计数对齐）
-    const n = x.length, m = y.length; const dp = new Int32Array((n + 1) * (m + 1));
-    for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--)
-      dp[i * (m + 1) + j] = x[i] === y[j] ? dp[(i + 1) * (m + 1) + j + 1] + 1 : Math.max(dp[(i + 1) * (m + 1) + j], dp[i * (m + 1) + j + 1]);
-    return dp;
-  };
-  const keepO = new Set(); { const dp = lcs(B, O); let i = 0, j = 0;
-    while (i < B.length && j < O.length) { if (B[i] === O[j]) { keepO.add(i); i++; j++; } else if (dp[(i + 1) * (O.length + 1) + j] >= dp[i * (O.length + 1) + j + 1]) i++; else j++; } }
-  const keepT = new Set(); { const dp = lcs(B, T); let i = 0, j = 0;
-    while (i < B.length && j < T.length) { if (B[i] === T[j]) { keepT.add(i); i++; j++; } else if (dp[(i + 1) * (T.length + 1) + j] >= dp[i * (T.length + 1) + j + 1]) i++; else j++; } }
-  // 生成合并：同区间单侧改→取侧；双侧改→冲突块
-  const out = []; let conflicts = 0;
-  const oIns = {}, tIns = {}; // baseIdx -> [lines]
-  { let bi = 0; for (let k = 0; k < O.length; k++) { if (bi < B.length && O[k] === B[bi] && keepO.has(bi)) { bi++; } else { (oIns[bi] = oIns[bi] || []).push(O[k]); } } }
-  { let bi = 0; for (let k = 0; k < T.length; k++) { if (bi < B.length && T[k] === B[bi] && keepT.has(bi)) { bi++; } else { (tIns[bi] = tIns[bi] || []).push(T[k]); } } }
-  let i = 0;
-  for (; i <= B.length; i++) {
-    const oi = oIns[i] || [], ti = tIns[i] || [];
-    if (oi.length && ti.length && oi.join('\n') !== ti.join('\n')) {
-      out.push('<<<<<<< OURS', ...oi, '=======', ...ti, '>>>>>>> THEIRS'); conflicts++;
-    } else if (oi.length) out.push(...oi);
-    else if (ti.length) out.push(...ti);
-    if (i < B.length) out.push(B[i]);
+  const cO = chunksFromPairs(pO, B.length, O), cT = chunksFromPairs(pT, B.length, T);
+  const all = [
+    ...cO.map(c => ({ ...c, side: 'o' })),
+    ...cT.map(c => ({ ...c, side: 't' }))
+  ].sort((a, b) => a.b0 - b.b0 || a.b1 - b.b1);
+  const out = []; let conflicts = 0, bCur = 0, i = 0;
+  while (i < all.length) {
+    // 收集重叠组：base 区间 [b0,b1) 相交的 chunk 一起处理
+    const group = [all[i]]; let end = all[i].b1; i++;
+    // 区间相交，或同起点的双侧改动（含同点纯插入）→ 必须同组裁决
+    while (i < all.length && (all[i].b0 < end || all[i].b0 === group[0].b0)) { group.push(all[i]); end = Math.max(end, all[i].b1); i++; }
+    const start = group[0].b0;
+    if (start > bCur) { for (let k = bCur; k < start; k++) out.push(B[k]); bCur = start; }
+    const gO = group.filter(g => g.side === 'o'), gT = group.filter(g => g.side === 't');
+    if (gO.length === 0) { out.push(...gT[0].s); }
+    else if (gT.length === 0) { out.push(...gO[0].s); }
+    else if (gO.length === 1 && gT.length === 1 && gO[0].s.join('\n') === gT[0].s.join('\n')) { out.push(...gO[0].s); }
+    else {
+      out.push('<<<<<<< OURS', ...gO.flatMap(g => g.s), '=======', ...gT.flatMap(g => g.s), '>>>>>>> THEIRS'); conflicts++;
+    }
+    bCur = end;
   }
+  if (bCur < B.length) for (let k = bCur; k < B.length; k++) out.push(B[k]);
   return { text: out.join('\n'), conflicts };
 }
 
@@ -168,9 +210,23 @@ async function doMerge(root, srcBr, dstBr, opts) {
   const sm2 = tm; // dst 侧
   const result = {};
   const paths = new Set([...Object.keys(sm2), ...Object.keys(amM), ...Object.keys(bm)]);
-  let conflicts = 0; const report = [];
+  let conflicts = 0; const report = []; const renames = [];
   const curWork = await loadCache(root);
+  // rename 检测（v1.2）：一侧删除旧路径且新增同哈希内容 = 重命名；对侧对旧路径的修改迁移到新路径
+  const handled = new Set();
+  const oAddedByHash = {}; for (const p of Object.keys(sm2)) if (!bmM[p]) oAddedByHash[sm2[p].h] = p;
+  const tAddedByHash = {}; for (const p of Object.keys(amM)) if (!bmM[p]) tAddedByHash[amM[p].h] = p;
+  for (const p of Object.keys(bmM)) {
+    const yO = (!sm2[p] && oAddedByHash[bmM[p].h]) || null;  // ours 把 p 重命名为 yO（内容未动）
+    const yT = (!amM[p] && tAddedByHash[bmM[p].h]) || null;  // theirs 把 p 重命名为 yT
+    if (yO && amM[p] && amM[p].h !== bmM[p].h && !amM[yO] && !handled.has(yO)) {
+      result[yO] = amM[p]; handled.add(p); handled.add(yO); renames.push(`${p} -> ${yO}（采纳对侧修改）`);
+    } else if (yT && sm2[p] && sm2[p].h !== bmM[p].h && !sm2[yT] && !handled.has(yT)) {
+      result[yT] = sm2[p]; handled.add(p); handled.add(yT); renames.push(`${p} -> ${yT}（采纳本侧修改）`);
+    }
+  }
   for (const p of paths) {
+    if (handled.has(p)) continue;
     const inB = bm[p], inO = sm2[p], inT = amM[p];
     const hO = inO ? inO.h : null, hT = inT ? inT.h : null, hB = inB ? inB.h : null;
     if (hO === hT) { if (hO) result[p] = inO; continue; }
@@ -189,6 +245,7 @@ async function doMerge(root, srcBr, dstBr, opts) {
     }
   }
   if (conflicts && opts.conflict === 'abort') { report.forEach(p => console.error('CONFLICT ' + p)); throw new Error(`合并中止：${conflicts} 个冲突`); }
+  if (renames.length && opts.reportRenames) renames.forEach(r => ok('RENAME ' + r));
   const treeH = await put(root, manifestBuf(result));
   // 快照对象本身参与内容寻址：id = 对象哈希（存的是完整记录）
   const snap = { tree: treeH, parents: [a, b], msg: opts.msg || `merge ${srcBr}->${dstBr}`, ts: Date.now(), branch: dstBr };
@@ -373,7 +430,7 @@ async function cmdMerge(root, src, arg2) {
   let dst = 'main', msg;
   if (arg2 && arg2.startsWith('--into=')) dst = arg2.slice(7);
   else if (arg2) msg = arg2;
-  const r = await doMerge(root, src, dst, { conflict: 'mark', msg });
+  const r = await doMerge(root, src, dst, { conflict: 'mark', msg, reportRenames: true });
   ok(`${r.id.slice(0, 12)} 合并 ${src} -> ${dst}${r.conflicts ? `（${r.conflicts} 冲突已标记）` : '（干净）'}`);
   if (r.report.length) r.report.forEach(p => console.error('  CONFLICT: ' + p));
 }
