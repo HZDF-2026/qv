@@ -187,6 +187,21 @@ t('T1b .qvignore 带 BOM 仍生效（v1.2.1：PS5.1 Set-Content UTF8 坑）', ()
   assert(!d.includes('junk.db'), '被忽略文件不应入册');
 });
 
+t('R2 外部盲改后 switch 强制恢复（真实缺陷回归：缓存被外部编辑骗）', () => {
+  const D = tmp();
+  fs.writeFileSync(path.join(D, 'code.cpp'), 'int main() { return 0; }\n');
+  qv(D, 'init');
+  const orig = R(D, 'code.cpp');
+  // 外部改动（不经 qv 流程，模拟手工编辑器/其他工具写坏）
+  fs.appendFileSync(path.join(D, 'code.cpp'), '// BROKEN EXPERIMENT\n');
+  assert(R(D, 'code.cpp') !== orig, '前置失败');
+  qv(D, 'switch', 'main');                       // 应强制恢复基线
+  assert(R(D, 'code.cpp') === orig, 'switch 后外部改动应被检出恢复: ' + JSON.stringify(R(D, 'code.cpp')));
+  const d = qv(D, 'diff');
+  assert(d.includes('一致'), '恢复后 diff 应干净: ' + d);
+  qv(D, 'verify', '--deep');
+});
+
 // ===== 3. 异常与安全 =====
 t('S1 路径穿越防护（恶意 manifest 拒绝写盘）', () => {
   const B = tmp(); fs.writeFileSync(path.join(B, 'ok.txt'), '1\n'); qv(B, 'init');

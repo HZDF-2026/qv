@@ -46,18 +46,28 @@ async function loadIgnores(root) {
   const rxs = pats.map(p => {
     const dir = p.endsWith('/');
     const body = p.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[^/]*');
-    return dir ? new RegExp('^' + body) : new RegExp('(^|/)' + body + '$');
+    return dir ? new RegExp('(^|/)' + body) : new RegExp('(^|/)' + body + '$');
   });
   return (p) => rxs.some(rx => rx.test(p));
 }
 
-// ---------- 工作区扫描（增量：mtime+size 未变沿用缓存哈希） ----------
+// ---------- 工作区扫描（增量：mtime+size 未变沿用缓存哈希；无权限目录容错跳过） ----------
+async function walkDir(root, dir, ignored, out) {
+  let entries;
+  try { entries = await fsp.readdir(dir, { withFileTypes: true }); }
+  catch { return; } // EPERM / EBUSY / EBADF（System Volume Information 等）→ 跳过不崩
+  for (const e of entries) {
+    const p = path.relative(root, path.join(dir, e.name)).replace(/\\/g, '/');
+    if (e.isDirectory()) {
+      if (p === QV || ignored(p + '/')) continue;
+      await walkDir(root, path.join(dir, e.name), ignored, out);
+    } else if (e.isFile() && p !== QV && !ignored(p)) out.push(p);
+  }
+}
 async function scanWorkdir(root, last) {
   const ignored = await loadIgnores(root);
-  const all = await fsp.readdir(root, { recursive: true, withFileTypes: true });
-  const files = all.filter(d => d.isFile()).map(d => path.relative(root, path.join(d.parentPath || d.path, d.name)).replace(/\\/g, '/'))
-    .filter(p => p !== QV && !p.startsWith(QV + '/'))
-    .filter(p => !ignored(p));
+  const files = [];
+  await walkDir(root, root, ignored, files);
   const m = {};
   const queue = [...files];
   while (queue.length) {
@@ -106,7 +116,16 @@ async function restore(root, target) {
   for (const p of paths) if (!safePath(p)) die(`非法路径（拒绝写入）: ${JSON.stringify(p)}`);
   const toDel = Object.keys(cur).filter(p => !(p in target)).filter(p => !ignored(p));
   await Promise.all(toDel.map(p => fsp.rm(path.join(root, p), { force: true })));
-  const toWrite = Object.keys(target).filter(p => !(p in cur) || cur[p].h !== target[p].h);
+  // 写入判断不信缓存：stat 事实核对（外部改动 size 不符必须重写，缓存会被外部编辑骗）
+  const toWrite = [];
+  for (const p of Object.keys(target)) {
+    let need = !cur[p] || cur[p].h !== target[p].h;
+    if (!need) {
+      try { const st = await fsp.stat(path.join(root, p)); if (st.size !== target[p].s) need = true; }
+      catch { need = true; }
+    }
+    if (need) toWrite.push(p);
+  }
   const q = [...toWrite];
   while (q.length) {
     const batch = q.splice(0, CONC);
