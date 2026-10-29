@@ -80,6 +80,10 @@ node test/industrial-suite.js   # 21 industrial (units, cross-repo roundtrip, po
 - **Rename detection**: one side renames a file, the other edits it → the edit migrates to the new path instead of being lost.
 - **`.qvignore`** (gitignore-style subset): keeps 46MB sqlite files, `dist/`, caches out of the object store. Built-in minimum defaults: `node_modules/`, `__pycache__/`. Ignored-but-previously-tracked files are never deleted from your workdir by `switch`.
 
+Patch releases (same field-trial loop):
+- **v1.2.1** — BOM stripped from `.qvignore` on load (PowerShell 5.1/Notepad UTF-8 trap disarmed at the read side).
+- **v1.2.2** — real-deployment hardening: tolerant walk past permission-denied system dirs; restores stat-verify disk sizes instead of trusting the manifest cache (out-of-band edits can no longer survive `switch`). Single source of version truth: `qv --version`.
+
 ## Honest limitations
 
 - LAN bundle sync is **explicit** (no server, no auto-push) — a feature in hostile networks.

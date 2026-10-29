@@ -9,6 +9,7 @@ const crypto = require('crypto');
 
 const QV = '.qv';
 const CONC = 32;
+const VERSION = '1.2.2';
 
 const die = (m) => { console.error('qv: ' + m); process.exit(1); };
 const ok = (m) => { console.log(m); };
@@ -537,6 +538,7 @@ async function main() {
   const [cmd, ...rest] = process.argv.slice(2);
   const root = process.cwd();
   switch (cmd) {
+    case '--version': case '-v': case 'version': return ok('qv ' + VERSION);
     case 'init': return cmdInit(root);
     case 'snap': return cmdSnap(root, rest);
     case 'branch': return cmdBranch(root, rest[0]);
