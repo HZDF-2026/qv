@@ -9,7 +9,7 @@ const crypto = require('crypto');
 
 const QV = '.qv';
 const CONC = 32;
-const VERSION = '1.2.2';
+const VERSION = '1.3.0';
 
 const die = (m) => { console.error('qv: ' + m); process.exit(1); };
 const ok = (m) => { console.log(m); };
@@ -514,10 +514,34 @@ async function cmdGc(root) {
   ok(`gc：保留 ${live.size} 个可达对象，清理 ${removed} 个孤儿`);
 }
 
-async function cmdDiff(root, arg) {
+async function resolveTarget(root, snaps, target) {
+  if (!target) return null;
+  const h = await readHead(root, target);
+  if (h) return { id: h, br: target };
+  if (snaps.has(target)) return { id: target, br: snaps.get(target).branch };
+  const k = Array.from(snaps.keys()).find(k => k.startsWith(target));
+  if (k) return { id: k, br: snaps.get(k).branch };
+  return null;
+}
+async function cmdDiff(root, arg1, arg2) {
   const snaps = await loadSnaps(root);
+  // 两参数：任意两快照/分支对比（Scion "queries as API" 启发）
+  if (arg1 && arg2) {
+    const A = await resolveTarget(root, snaps, arg1), B = await resolveTarget(root, snaps, arg2);
+    if (!A) die(`未找到: ${arg1}`); if (!B) die(`未找到: ${arg2}`);
+    const mA = JSON.parse((await get(root, snaps.get(A.id).tree)).toString());
+    const mB = JSON.parse((await get(root, snaps.get(B.id).tree)).toString());
+    let n = 0;
+    for (const p of new Set([...Object.keys(mA), ...Object.keys(mB)])) {
+      const ha = mA[p] && mA[p].h, hb = mB[p] && mB[p].h;
+      if (ha !== hb) { ok(`${!ha ? '+' : !hb ? '-' : '~'} ${p}`); n++; }
+    }
+    if (!n) ok(`${arg1} 与 ${arg2} 内容一致`);
+    return;
+  }
   const cur = await scanWorkdir(root, await loadCache(root));
-  const headId = await readHead(root, arg || (await currentBranch(root)));
+  const headId = await readHead(root, arg1 || (await currentBranch(root)));
+  if (!headId) die(`分支不存在: ${arg1 || await currentBranch(root)}`);
   const head = JSON.parse((await get(root, snaps.get(headId).tree)).toString());
   let n = 0;
   for (const p of new Set([...Object.keys(cur), ...Object.keys(head)])) {
@@ -551,10 +575,10 @@ async function main() {
     case 'export': return cmdExport(root, rest[0]);
     case 'import': return cmdImport(root, rest[0]);
     case 'gc': return cmdGc(root);
-    case 'diff': return cmdDiff(root, rest[0]);
+    case 'diff': return cmdDiff(root, rest[0], rest[1]);
     case 'status': return cmdStatus(root);
     default:
-      ok('qv — 快照模型 VCS（实验 O(1) / sha256 内容寻址 / 批量合并）\n用法: init | snap [-m msg] | branch [name] | switch <br|snap> | log | merge <src> [--into=dst] | batch-merge [pattern...] | verify [--deep] | export <file.qvb> | import <file.qvb> | gc | diff | status | drop <br>');
+      ok('qv — 快照模型 VCS（实验 O(1) / sha256 内容寻址 / 批量合并）\n用法: init | snap [-m msg] | branch [name] | switch <br|snap> | log | merge <src> [--into=dst] | batch-merge [pattern...] | verify [--deep] | export <file.qvb> | import <file.qvb> | diff [<a> <b>] | status | drop <br> | --version');
       if (cmd) die('未知命令: ' + cmd);
   }
 }

@@ -202,6 +202,23 @@ t('R2 外部盲改后 switch 强制恢复（真实缺陷回归：缓存被外部
   qv(D, 'verify', '--deep');
 });
 
+t('D1 任意两快照 diff（v1.3：Scion queries-as-API 启发）', () => {
+  const D = tmp();
+  fs.writeFileSync(path.join(D, 'a.txt'), 'v1\n'); fs.writeFileSync(path.join(D, 'b.txt'), 'x\n');
+  qv(D, 'init');
+  qv(D, 'branch', 'dev');
+  fs.writeFileSync(path.join(D, 'b.txt'), 'y\n'); fs.writeFileSync(path.join(D, 'c.txt'), 'new\n');
+  fs.unlinkSync(path.join(D, 'a.txt'));
+  qv(D, 'snap', '-m', 'dev');
+  const o = qv(D, 'diff', 'main', 'dev');
+  assert(o.includes('~ b.txt'), '修改应报出: ' + o);
+  assert(o.includes('+ c.txt'), '新增应报出: ' + o);
+  assert(o.includes('- a.txt'), '删除应报出: ' + o);
+  const o2 = qv(D, 'diff', 'dev', 'dev');
+  assert(o2.includes('内容一致'), '自比较应一致: ' + o2);
+  assert(qvFail(D, 'diff', 'main', 'nosuch'), '未知目标应报错');
+});
+
 // ===== 3. 异常与安全 =====
 t('S1 路径穿越防护（恶意 manifest 拒绝写盘）', () => {
   const B = tmp(); fs.writeFileSync(path.join(B, 'ok.txt'), '1\n'); qv(B, 'init');

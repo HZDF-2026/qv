@@ -84,6 +84,10 @@ Patch releases (same field-trial loop):
 - **v1.2.1** — BOM stripped from `.qvignore` on load (PowerShell 5.1/Notepad UTF-8 trap disarmed at the read side).
 - **v1.2.2** — real-deployment hardening: tolerant walk past permission-denied system dirs; restores stat-verify disk sizes instead of trusting the manifest cache (out-of-band edits can no longer survive `switch`). Single source of version truth: `qv --version`.
 
+## v1.3 — any-snapshot diff (from Scion comparison)
+
+`qv diff <a> <b>` now diffs any two branches/snapshots (`+`/`-`/`~`), filling qv's biggest query gap. Born from an honest comparison against Anthropic's internal VCS — the full analysis, including the unmet points we deliberately record instead of build (delta manifests, sparse checkouts, daemon mode), is in [docs/SCION_NOTES.md](docs/SCION_NOTES.md).
+
 ## Honest limitations
 
 - LAN bundle sync is **explicit** (no server, no auto-push) — a feature in hostile networks.
