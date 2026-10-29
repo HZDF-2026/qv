@@ -10,12 +10,13 @@ const { execFileSync } = require('child_process');
 
 const QV = '.qv';
 const CONC = 32;
-const VERSION = '1.4.0';
+const VERSION = '1.4.1';
 const BIG_FILE = 64 * 1024 * 1024;   // 超过此尺寸走分块存储（AI checkpoint/模型权重场景）
 const CHUNK = 8 * 1024 * 1024;       // 分块大小
 
 const die = (m) => { console.error('qv: ' + m); process.exit(1); };
 const ok = (m) => { console.log(m); };
+const BRANCH_OK = /^[A-Za-z0-9_.-]{1,64}$/; // 分支名白名单：bundle/import 不可信输入的路径穿越防线
 // 路径安全：manifest/bundle 是不可信输入，防路径穿越
 function safePath(p) {
   if (!p || typeof p !== 'string' || p.includes('\0') || /^[a-zA-Z]:/.test(p) || p.startsWith('/') || p.startsWith('\\') || p.split('/').includes('..') || p.split('\\').includes('..')) return false;
@@ -385,7 +386,10 @@ async function cmdImport(root, file) {
   }
   const inHeads = JSON.parse(buf.subarray(rIdx + 11).toString());
   const newBranches = [];
+  const postSnaps = await loadSnaps(root); // 校验分支指向的快照真实存在（防悬空引用）
   for (const b of Object.keys(inHeads)) {
+    if (!BRANCH_OK.test(b)) die(`非法分支名（拒绝导入）: ${JSON.stringify(b)}`);
+    if (!/^[0-9a-f]{64}$/.test(inHeads[b] || '') || !postSnaps.has(inHeads[b])) die(`非法/悬空快照哈希（拒绝导入）: ${b}`);
     let name = b;
     if (await readHead(root, name)) { if (await readHead(root, name) === inHeads[b]) continue; name = b + '-peer'; }
     await writeHead(root, name, inHeads[b]);
@@ -532,11 +536,28 @@ async function cmdLog(root, br) {
 }
 
 async function cmdDrop(root, target) {
+  if (!BRANCH_OK.test(target || '')) die(`非法分支名: ${JSON.stringify(target)}`);
+  if ((await currentBranch(root)) === target) die(`不能 drop 当前分支（先 qv switch 其他分支）`);
   const f = path.join(headsDir(root), target);
   try { await fsp.access(f); } catch { die(`分支不存在: ${target}`); }
+  const droppedTo = (await fsp.readFile(f, 'utf8')).trim();
   await fsp.rm(f);
-  await fsp.appendFile(path.join(root, QV, 'reflog.jsonl'), JSON.stringify({ ts: Date.now(), drop: target }) + '\n');
-  ok(`已丢弃 ${target}（reflog 可追溯，对象留待 qv gc）`);
+  await fsp.appendFile(path.join(root, QV, 'reflog.jsonl'), JSON.stringify({ ts: Date.now(), drop: target, to: droppedTo }) + '\n');
+  ok(`已丢弃 ${target}（qv undrop 可撤销，对象留待 qv gc）`);
+}
+
+async function cmdUndrop(root) {
+  const txt = await fsp.readFile(path.join(root, QV, 'reflog.jsonl'), 'utf8');
+  const lines = txt.trim().split('\n').map(l => JSON.parse(l));
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const e = lines[i];
+    if (e.drop && e.to && !(await readHead(root, e.drop))) {
+      if (await readHead(root, e.drop + '-peer')) { die(`名字被占用: ${e.drop}-peer`); }
+      await writeHead(root, e.drop, e.to);
+      return ok(`已撤销删除: ${e.drop} -> ${e.to.slice(0, 12)}`);
+    }
+  }
+  die('reflog 中没有可撤销的 drop');
 }
 
 async function cmdMerge(root, src, arg2) {
@@ -673,6 +694,7 @@ async function main() {
     case 'switch': return cmdSwitch(root, rest[0]);
     case 'log': return cmdLog(root, rest[0]);
     case 'drop': return cmdDrop(root, rest[0]);
+    case 'undrop': return cmdUndrop(root);
     case 'merge': return cmdMerge(root, rest[0], rest[1]);
     case 'batch-merge': return cmdBatchMerge(root, rest);
     case 'verify': return cmdVerify(root, rest.includes('--deep'));

@@ -381,5 +381,37 @@ t('R1 gc 幂等 + drop reflog 可追溯', () => {
   assert(reflog.includes('"drop":"tmp1"'), 'reflog 未记录 drop');
 });
 
+// ===== 6.5 v1.4.1：安全与可撤销 =====
+t('X1 恶意 bundle 分支名路径穿越拒绝（新攻击面）', () => {
+  const A = tmp(), B = tmp();
+  fs.writeFileSync(path.join(A, 'ok.txt'), '1\n'); qv(A, 'init');
+  const bundle = path.join(tmp(), 'evil-name.qvb');
+  qv(A, 'export', bundle);
+  // 手工改写 bundle 尾部 REFS：注入 ../evil 分支名
+  const raw = fs.readFileSync(bundle).toString('utf8');
+  const idx = raw.lastIndexOf('===REFS===');
+  const forged = raw.slice(0, idx + 11) + JSON.stringify({ '../evil': (JSON.parse(raw.slice(idx + 11)).main) });
+  fs.writeFileSync(bundle, forged);
+  fs.writeFileSync(path.join(B, 'b.txt'), '1\n'); qv(B, 'init');
+  assert(qvFail(B, 'import', bundle), '穿越分支名应拒绝');
+  assert(!fs.existsSync(path.join(B, '.qv', 'refs', 'evil')), 'refs 外文件被写出！');
+});
+t('X2 undrop 撤销删除（用户需求）', () => {
+  const D = tmp(); fs.writeFileSync(path.join(D, 'a.txt'), '1\n'); qv(D, 'init');
+  qv(D, 'branch', 'tmp1'); W(D, 'x.txt', 'x'); qv(D, 'snap', '-m', 't'); qv(D, 'switch', 'main');
+  qv(D, 'drop', 'tmp1');
+  assert(qvFail(D, 'log', 'tmp1'), 'drop 后 log 应失败');
+  qv(D, 'undrop');
+  assert(qv(D, 'log', 'tmp1').includes('t'), 'undrop 后分支应可用');
+  qv(D, 'switch', 'tmp1');
+  assert(R(D, 'x.txt') === 'x', 'undrop+switch 后 x.txt 应恢复');
+  qv(D, 'verify', '--deep');
+});
+t('X3 drop 当前分支被拒', () => {
+  const D = tmp(); fs.writeFileSync(path.join(D, 'a.txt'), '1\n'); qv(D, 'init');
+  assert(qvFail(D, 'drop', 'main'), 'drop 当前分支应被拒绝');
+});
+
+// ===== 7. 汇总 =====
 console.log(`\n工业套件: ${pass} passed, ${fail} failed${failures.length ? ' — ' + failures.join(', ') : ''}`);
 process.exit(fail ? 1 : 0);
