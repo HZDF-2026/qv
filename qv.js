@@ -40,7 +40,7 @@ function manifestHash(m) { return crypto.createHash('sha256').update(manifestBuf
 async function loadIgnores(root) {
   const pats = ['node_modules/', '__pycache__/'];
   try {
-    const txt = await fsp.readFile(path.join(root, '.qvignore'), 'utf8');
+    const txt = (await fsp.readFile(path.join(root, '.qvignore'), 'utf8')).replace(/^\ufeff/, ''); // 剥 BOM：PowerShell 5.1/Notepad 写 UTF-8 带 BOM 会粘死第一条规则
     for (let ln of txt.split(/\r?\n/)) { ln = ln.trim(); if (ln && !ln.startsWith('#')) pats.push(ln); }
   } catch {}
   const rxs = pats.map(p => {

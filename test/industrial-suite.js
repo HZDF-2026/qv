@@ -176,6 +176,17 @@ t('T1 .qvignore 忽略规则（v1.2：大文件/产物目录不入对象库）',
   assert(out2.includes('1 个文件'), '内置默认应忽略 node_modules: ' + out2);
 });
 
+t('T1b .qvignore 带 BOM 仍生效（v1.2.1：PS5.1 Set-Content UTF8 坑）', () => {
+  const D = tmp();
+  fs.writeFileSync(path.join(D, 'code.js'), '1\n');            // 无 BOM
+  fs.writeFileSync(path.join(D, 'junk.db'), 'big data');
+  fs.writeFileSync(path.join(D, '.qvignore'), '\ufeff*.db\n', 'utf8'); // 模拟 PowerShell 5.1 UTF8 BOM
+  const out = qv(D, 'init');
+  assert(out.includes('2 个文件'), 'BOM 不应废掉第一条规则: ' + out);
+  const d = qv(D, 'diff');
+  assert(!d.includes('junk.db'), '被忽略文件不应入册');
+});
+
 // ===== 3. 异常与安全 =====
 t('S1 路径穿越防护（恶意 manifest 拒绝写盘）', () => {
   const B = tmp(); fs.writeFileSync(path.join(B, 'ok.txt'), '1\n'); qv(B, 'init');
