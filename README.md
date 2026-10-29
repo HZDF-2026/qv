@@ -63,7 +63,7 @@ Poison-proof: every object is re-hashed on import — a mismatched hash rejects 
 | batch-merge 30 branches | 0.93s |
 | stress: init 10,000 files / 200-branch batch-merge | 16s / 3.2s |
 
-## Tests — 32 green
+## Tests — 36 green
 
 ```bash
 node test/run-tests.js          # 15 e2e (conflicts, batch-merge, tamper detection, benchmarks)
