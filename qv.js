@@ -12,6 +12,11 @@ const CONC = 32;
 
 const die = (m) => { console.error('qv: ' + m); process.exit(1); };
 const ok = (m) => { console.log(m); };
+// 路径安全：manifest/bundle 是不可信输入，防路径穿越
+function safePath(p) {
+  if (!p || typeof p !== 'string' || p.includes('\0') || /^[a-zA-Z]:/.test(p) || p.startsWith('/') || p.startsWith('\\') || p.split('/').includes('..') || p.split('\\').includes('..')) return false;
+  return true;
+}
 
 // ---------- 对象库（内容寻址存储：sha256 键，明文存储——任何字节篡改可被 verify 直接检出） ----------
 function objDir(root, h) { return path.join(root, QV, 'objects', h.slice(0, 2)); }
@@ -79,6 +84,8 @@ async function loadCache(root) { try { return (JSON.parse(await fsp.readFile(pat
 // ---------- 工作区恢复（只写差异：目标 vs 缓存盘面） ----------
 async function restore(root, target) {
   const cur = (await loadCache(root)) || {};
+  const paths = Object.keys(target);
+  for (const p of paths) if (!safePath(p)) die(`非法路径（拒绝写入）: ${JSON.stringify(p)}`);
   const toDel = Object.keys(cur).filter(p => !(p in target));
   await Promise.all(toDel.map(p => fsp.rm(path.join(root, p), { force: true })));
   const toWrite = Object.keys(target).filter(p => !(p in cur) || cur[p].h !== target[p].h);
@@ -194,6 +201,96 @@ async function doMerge(root, srcBr, dstBr, opts) {
 }
 
 // ---------- 命令实现 ----------
+// ---------- 局域网协作：bundle 导出/导入（不可信输入，全量重哈希校验） ----------
+const BUNDLE_MAGIC = 'QVB1\n';
+async function collectReachable(root) {
+  const snaps = await loadSnaps(root);
+  const hashes = new Set();
+  for (const s of snaps.values()) {
+    hashes.add(s.id); hashes.add(s.tree);
+    const m = JSON.parse((await get(root, s.tree)).toString());
+    for (const p of Object.keys(m)) hashes.add(m[p].h);
+  }
+  return { snaps, hashes };
+}
+async function cmdExport(root, file) {
+  if (!file) die('用法: qv export <file.qvb>');
+  const { snaps, hashes } = await collectReachable(root);
+  const heads = {};
+  for (const b of await fsp.readdir(headsDir(root))) heads[b] = await readHead(root, b);
+  const snapLog = await fsp.readFile(path.join(root, QV, 'snapshots.jsonl'));
+  const parts = [];
+  for (const h of hashes) parts.push(await get(root, h));
+  const header = Buffer.from(BUNDLE_MAGIC + hashes.size + '\n' + parts.map((b, i) => [...hashes][i] + ' ' + b.length).join('\n') + '\n', 'utf8');
+  const sepSnaps = Buffer.from('\n===SNAPS===\n', 'utf8');
+  const sepRefs = Buffer.from('\n===REFS===\n', 'utf8');
+  await fsp.writeFile(file, Buffer.concat([header, ...parts, sepSnaps, snapLog, sepRefs, Buffer.from(JSON.stringify(heads))]));
+  ok(`导出 ${hashes.size} 对象 / ${snaps.size} 快照 / ${Object.keys(heads).length} 分支 -> ${file}`);
+}
+async function cmdImport(root, file) {
+  if (!file) die('用法: qv import <file.qvb>');
+  // clone 语义：空目录导入即初始化（协作新成员起步方式）
+  const isClone = !fs.existsSync(path.join(root, QV));
+  if (isClone) {
+    await fsp.mkdir(path.join(root, QV, 'refs', 'heads'), { recursive: true });
+    await fsp.writeFile(path.join(root, QV, 'config.json'), JSON.stringify({ v: 1, algo: 'sha256', created: Date.now() }, null, 2));
+    await fsp.writeFile(path.join(root, QV, 'HEAD'), 'main\n');
+  }
+  let buf;
+  try { buf = await fsp.readFile(file); } catch { die(`无法读取: ${file}`); }
+  if (!buf.subarray(0, 5).equals(Buffer.from(BUNDLE_MAGIC))) die('不是 qv bundle（魔数不符）');
+  // 解析对象表
+  const headEnd = buf.indexOf(10, 5); // 换行：对象个数行
+  const nObj = parseInt(buf.subarray(5, headEnd).toString(), 10);
+  let off = headEnd + 1;
+  const table = [];
+  for (let i = 0; i < nObj; i++) {
+    const eol = buf.indexOf(10, off);
+    const [h, sz] = buf.subarray(off, eol).toString().split(' ');
+    if (!/^[0-9a-f]{64}$/.test(h)) die(`非法哈希: ${h}`);
+    table.push({ h, sz: parseInt(sz, 10) });
+    off = eol + 1;
+  }
+  // 读对象体并全量重哈希（防投毒：内容哈希必须等于声称键）
+  let imported = 0, skipped = 0;
+  for (const t of table) {
+    const body = buf.subarray(off, off + t.sz); off += t.sz;
+    const real = crypto.createHash('sha256').update(body).digest('hex');
+    if (real !== t.h) die(`对象哈希不符（拒绝导入）: ${t.h.slice(0, 12)}`);
+    if (await has(root, t.h)) skipped++; else { await fsp.mkdir(objDir(root, t.h), { recursive: true }); await fsp.writeFile(path.join(objDir(root, t.h), t.h.slice(2)), body); imported++; }
+  }
+  const sIdx = buf.indexOf('===SNAPS===', off);
+  const rIdx = buf.indexOf('===REFS===', sIdx);
+  if (sIdx < 0 || rIdx < 0 || rIdx < sIdx) die('bundle 结构损坏');
+  const inSnaps = buf.subarray(sIdx + 12, rIdx).toString().trim();
+  const have = await loadSnaps(root);
+  let addSnaps = 0;
+  for (const ln of inSnaps.split('\n')) {
+    if (!ln.trim()) continue;
+    const o = JSON.parse(ln);
+    if (!have.has(o.id)) { await appendSnap(root, o); addSnaps++; }
+  }
+  const inHeads = JSON.parse(buf.subarray(rIdx + 11).toString());
+  const newBranches = [];
+  for (const b of Object.keys(inHeads)) {
+    let name = b;
+    if (await readHead(root, name)) { if (await readHead(root, name) === inHeads[b]) continue; name = b + '-peer'; }
+    await writeHead(root, name, inHeads[b]);
+    newBranches.push(name);
+  }
+  ok(`导入 ${imported} 对象（${skipped} 已有）/ ${addSnaps} 快照；分支: ${newBranches.join(', ') || '(无新增)'}`);
+  if (newBranches.length) ok(`可合并: qv merge ${newBranches[0]}   或批量: qv batch-merge`);
+  // clone 模式：落盘主分支工作区（否则新成员拿到的是空目录）
+  if (isClone) {
+    const snaps2 = await loadSnaps(root);
+    const mainId = inHeads['main'] || Object.values(inHeads)[0];
+    if (mainId && snaps2.has(mainId)) {
+      await restore(root, JSON.parse((await get(root, snaps2.get(mainId).tree)).toString()));
+      ok(`已检出 ${inHeads['main'] ? 'main' : Object.keys(inHeads)[0]} 分支工作区（${Object.keys(JSON.parse((await get(root, snaps2.get(mainId).tree)).toString())).length} 文件）`);
+    }
+  }
+}
+
 async function cmdInit(root) {
   const d = path.join(root, QV);
   try { await fsp.access(d); die('已初始化（.qv 存在）'); } catch {}
@@ -373,12 +470,15 @@ async function main() {
     case 'merge': return cmdMerge(root, rest[0], rest[1]);
     case 'batch-merge': return cmdBatchMerge(root, rest);
     case 'verify': return cmdVerify(root, rest.includes('--deep'));
+    case 'export': return cmdExport(root, rest[0]);
+    case 'import': return cmdImport(root, rest[0]);
     case 'gc': return cmdGc(root);
     case 'diff': return cmdDiff(root, rest[0]);
     case 'status': return cmdStatus(root);
     default:
-      ok('qv — 快照模型 VCS（实验 O(1) / sha256 内容寻址 / 批量合并）\n用法: init | snap [-m msg] | branch [name] | switch <br|snap> | log | merge <src> [--into=dst] | batch-merge [pattern...] | verify [--deep] | gc | diff | status | drop <br>');
+      ok('qv — 快照模型 VCS（实验 O(1) / sha256 内容寻址 / 批量合并）\n用法: init | snap [-m msg] | branch [name] | switch <br|snap> | log | merge <src> [--into=dst] | batch-merge [pattern...] | verify [--deep] | export <file.qvb> | import <file.qvb> | gc | diff | status | drop <br>');
       if (cmd) die('未知命令: ' + cmd);
   }
 }
-main().catch(e => die(e.stack || e.message));
+if (require.main === module) main().catch(e => die(e.stack || e.message));
+module.exports = { diff3, safePath, manifestBuf, manifestHash };

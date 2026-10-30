@@ -47,7 +47,22 @@ node qv.js verify --deep              # 全库 Merkle 校验
 node qv.js gc / drop <br> / log / diff / status
 ```
 
-## 实测基准（Windows / Node 24 / NVMe，见 test/run-tests.js）
+## 局域网协作（v1.1）
+
+无服务器设计——bundle 文件即传输协议，SMB/scp/U 盘都行：
+
+```
+机器 A:  qv export a.qvb              # 打包全部可达对象+快照+分支
+机器 B:  qv import a.qvb              # 空目录导入 = clone（自动检出工作区）
+机器 B:  ...改代码...  qv snap
+机器 B:  qv merge feature-a            # 共同历史 → 正常三方合并
+```
+
+- **防投毒**：import 对每个对象全量重哈希，声称哈希≠实际内容直接拒绝整个 bundle。
+- **无关历史**：两个独立 `init` 的仓库合并（无共同祖先）按整文件冲突处理（同 git unrelated histories 语义），有测试钉死该行为。
+- **幂等**：重复 import 相同对象自动跳过；分支名冲突自动改名 `<branch>-peer`。
+
+## 实测基准（Windows / Node 24 / NVMe，见 test/）
 
 | 操作 | 耗时 |
 |---|---|
@@ -59,15 +74,18 @@ node qv.js gc / drop <br> / log / diff / status
 ## 测试
 
 ```bash
-node test/run-tests.js   # 15 项 e2e：含冲突合并、批量合并、篡改检测、基准
+node test/run-tests.js          # 15 项基础 e2e（含冲突/批量合并/篡改检测/基准）
+node test/industrial-suite.js   # 17 项工业套件（单元/跨仓往返/安全/边界/压力/幂等）
 ```
 
-## 诚实的局限（v1 有意不做）
+工业套件覆盖：diff3 与路径穿越**单元测试**、export/import 往返与 clone、篡改 bundle 拒绝、伪 bundle 拒绝、恶意 manifest 路径穿越防护、空文件/二进制/中文名/5MB 大文件/深层目录边界、**万文件仓库**、**200 分支批量合并**、300 深链、gc 幂等与 drop 可追溯。全部 32 项绿。
 
-- **单机工具**：无远端同步/网络协作——要协作的地方仍然是 git 的地盘（qv 与 git 可共存，qv 管实验，git 管对外历史）。
+## 诚实的局限（v1.1 有意不做）
+
+- **局域网 bundle 协作**而非常驻服务器：无自动同步/推送钩子——bundle 导出导入是显式动作（这在恶意内网中是特性不是缺陷）。
 - 行级合并用 LCS，超大文件（>5k 行双侧）退化为整文件冲突标记。
 - 无 rename 检测、无子模块、无 packfile——对象库明文优先保证可验证性，牺牲磁盘占用。
-- 适合：AI agent 并行实验区、个人快速原型场、大批量自动化变更线。不适合：团队协作仓库、巨型二进制资产库。
+- 适合：AI agent 并行实验区、个人快速原型场、大批量自动化变更线、小团队局域网协作。不适合：公网分布式团队协作（那仍然是 git 的地盘）。
 
 ## License
 
